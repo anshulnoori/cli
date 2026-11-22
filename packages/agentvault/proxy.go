@@ -19,6 +19,8 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -51,6 +53,12 @@ const (
 	maxRequestHeaderBytes = 1 << 20
 
 	maxConcurrentConns = 512
+
+	// An HTTP/1.1 tunnel carries one request at a time, so maxConcurrentConns also bounded in-flight requests.
+	// This keeps an HTTP/2 tunnel from multiplying that by x/net's default of 250.
+	maxHTTP2StreamsPerConn = 100
+	http2PingInterval      = 30 * time.Second
+	http2PingTimeout       = 15 * time.Second
 
 	maxLoggedPathLen   = 2048
 	maxLoggedMethodLen = 32
@@ -85,6 +93,9 @@ type Options struct {
 	OwnCa      *OwnCa
 	// Nil leaves the SOCKS5 listener off.
 	Socks5 *Socks5Options
+	// Host patterns, in the services' syntax, whose tunnels also offer HTTP/2, such as gRPC APIs. Every other
+	// host keeps HTTP/1.1 only. Empty leaves HTTP/2 off.
+	HTTP2Hosts string
 
 	OnReady func()
 }
@@ -96,6 +107,11 @@ type proxyServer struct {
 	sessionLogs *sessionLogRecorder
 	usage       *usageReporter
 	transport   http.RoundTripper
+	// The transports an HTTP/2 request leaves through, so one shared upstream connection per host is limited
+	// to the hosts that asked for HTTP/2.
+	http2Transport        http.RoundTripper
+	guardedHTTP2Transport http.RoundTripper
+	http2Hosts            []hostPattern
 	// SOCKS5 traffic that no service names goes out through this one, which refuses private destinations
 	// when it dials. Its own pool, so it never reuses a connection the unchecked transport opened.
 	guardedTransport   http.RoundTripper
@@ -157,6 +173,37 @@ func newUpstreamTransport() *http.Transport {
 		ForceAttemptHTTP2: false,
 		TLSNextProto:      map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
 	}
+}
+
+func newHTTP2UpstreamTransport(base *http.Transport) *http.Transport {
+	transport := base.Clone()
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	transport.Protocols = protocols
+	// Every session's streams to a host share one connection, so a connection that died without a FIN must be
+	// found by a ping rather than by TCP giving up minutes later.
+	transport.HTTP2 = &http.HTTP2Config{SendPingTimeout: http2PingInterval, PingTimeout: http2PingTimeout}
+	return transport
+}
+
+// gRPC bodies stream for the whole call: a bidi client sends a message and waits for the reply before sending more,
+// so nothing may wait for the end of the body before forwarding it.
+func streamsGRPCBody(req *http.Request, t tunnel) bool {
+	return t.http2 && isGRPC(req)
+}
+
+func isGRPC(req *http.Request) bool {
+	return strings.HasPrefix(req.Header.Get("Content-Type"), "application/grpc")
+}
+
+func (ps *proxyServer) offersHTTP2(hostname, port string) bool {
+	for _, pattern := range ps.http2Hosts {
+		if ok, _ := pattern.match(hostname, port); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ProxyAuthUsername is the fixed username half of the proxy URL handed to an agent. It carries no
@@ -374,6 +421,7 @@ type tunnel struct {
 	port         string
 	sessionToken string
 	viaSocks5    bool
+	http2        bool
 }
 
 // serveIntercepted takes over a connection the agent has been told is open to the target, from either door.
@@ -410,23 +458,55 @@ func (ps *proxyServer) serveIntercepted(conn net.Conn, t tunnel, leaf tls.Certif
 		return
 	}
 
+	// http/1.1 only, unless the host is one the operator listed for HTTP/2. An h2-only client to any other
+	// host fails ALPN here, which is a documented unsupported case rather than something to paper over with a
+	// silent downgrade.
+	nextProtos := []string{"http/1.1"}
+	if ps.offersHTTP2(t.hostname, t.port) {
+		nextProtos = []string{"h2", "http/1.1"}
+	}
 	tlsConn := tls.Server(buffered, &tls.Config{
 		Certificates: []tls.Certificate{leaf},
 		MinVersion:   tls.VersionTLS12,
-		// http/1.1 only. An h2-only client fails ALPN here, which is a documented unsupported case rather than
-		// something to paper over with a silent downgrade.
-		NextProtos: []string{"http/1.1"},
+		NextProtos:   nextProtos,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Debug().Err(err).Str("host", net.JoinHostPort(t.hostname, t.port)).Msg("agent-vault: tunnel TLS handshake failed")
-		// An HTTP/2-only client such as gRPC, or one that doesn't trust the proxy's CA, ends here.
+		// An HTTP/2-only client such as gRPC to a host not in --http2-hosts, or one that doesn't trust the proxy's
+		// CA, ends here.
 		ps.warnNotWebTraffic(t, "the TLS handshake failed: "+err.Error())
 		return
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 
 	t.scheme = "https"
+	if tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+		ps.serveHTTP2Tunnel(tlsConn, t)
+		return
+	}
 	ps.serveTunnel(tlsConn, t)
+}
+
+// serveHTTP2Tunnel has no read or write timeout: a gRPC call streams in both directions for as long as it lasts,
+// and x/net resets a stream whose write deadline fires even while it is only quiet. Pings find a client that is
+// gone. The half-close handling is not needed, since HTTP/2 ends a request with END_STREAM rather than by closing
+// the connection.
+func (ps *proxyServer) serveHTTP2Tunnel(conn *tls.Conn, t tunnel) {
+	t.http2 = true
+	server := &http2.Server{
+		IdleTimeout:          tunnelIdleTimeout,
+		MaxConcurrentStreams: maxHTTP2StreamsPerConn,
+		ReadIdleTimeout:      http2PingInterval,
+		PingTimeout:          http2PingTimeout,
+	}
+	server.ServeConn(conn, &http2.ServeConnOpts{
+		BaseConfig: &http.Server{
+			MaxHeaderBytes: maxRequestHeaderBytes,
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ps.forwardHTTP(w, r, t)
+		}),
+	})
 }
 
 const tlsRecordTypeHandshake = 0x16
@@ -462,7 +542,7 @@ func (ps *proxyServer) warnNotWebTraffic(t tunnel, reason string) {
 		Str("door", "socks5").
 		Str("host", net.JoinHostPort(t.hostname, t.port)).
 		Str("reason", reason).
-		Msg("agent-vault: closed a SOCKS5 connection the proxy can't handle; it handles only HTTP/1.1 web traffic from clients that trust its CA")
+		Msg("agent-vault: closed a SOCKS5 connection the proxy can't handle; it handles only web traffic from clients that trust its CA, over HTTP/1.1, or HTTP/2 for --http2-hosts")
 }
 
 // bufferedConn lets the first byte be peeked and then handed on, to tls.Server or to the plain HTTP
@@ -876,13 +956,34 @@ func (ps *proxyServer) forwardHTTP(w http.ResponseWriter, r *http.Request, t tun
 	// a well-formed truncated 200; aborting drops the connection so the agent sees a failure instead.
 	// httputil.ReverseProxy does the same for the same reason.
 	w.WriteHeader(resp.StatusCode)
-	fw := &flushingWriter{ResponseWriter: w, rc: http.NewResponseController(w)}
-	if _, copyErr := io.Copy(fw, resp.Body); copyErr != nil {
+	fw := &flushingWriter{ResponseWriter: w, rc: http.NewResponseController(w), quietAllowed: t.http2}
+	// A bidi gRPC client may wait for the response headers before it sends its first message. A reply with its
+	// status already in the headers is trailers-only, and must reach the client as one frame that ends the stream.
+	if t.http2 && resp.Header.Get("Grpc-Status") == "" {
+		_ = fw.rc.Flush()
+	}
+	_, copyErr := io.Copy(fw, resp.Body)
+	// gRPC puts its status in trailers, which the upstream transport fills in once the body has been read. An
+	// HTTP/1.1 agent never asked for them.
+	if copyErr == nil && t.http2 {
+		for name, values := range resp.Trailer {
+			if http.CanonicalHeaderKey(name) == http.CanonicalHeaderKey(HeaderAPIURL) ||
+				http.CanonicalHeaderKey(name) == http.CanonicalHeaderKey(HeaderDecision) ||
+				http.CanonicalHeaderKey(name) == http.CanonicalHeaderKey(HeaderService) {
+				continue
+			}
+			for _, v := range values {
+				dst.Add(http.TrailerPrefix+name, v)
+			}
+		}
+	}
+	if copyErr != nil {
 		// Only the upstream's failure is ours to report. A write error is the agent having stopped
 		// reading, which is its own business and what the standard library also stays quiet about. So is
 		// a cancelled context: the server cancels it when the agent hangs up, and that can reach the
 		// upstream read before the next write to the agent fails.
-		if fw.writeErr == nil && !errors.Is(copyErr, context.Canceled) {
+		// An HTTP/2 agent that cancels a stream shows up as a stream error on the upstream read, not as context.Canceled.
+		if fw.writeErr == nil && !errors.Is(copyErr, context.Canceled) && r.Context().Err() == nil {
 			log.Warn().Err(copyErr).Str("host", hostname).Msg("agent-vault: upstream stream failed part way")
 		}
 		// The request line above already logged the upstream's status, which the agent never got.
@@ -967,8 +1068,13 @@ func (ps *proxyServer) forward(req *http.Request, t tunnel) (*http.Response, *re
 	req.Host = hostHeaderForScheme(scheme, req.URL.Host)
 	req.RequestURI = ""
 
+	// gRPC servers require "TE: trailers", which is hop-by-hop but means the same on the next hop.
+	wantsTrailers := t.http2 && httpguts.HeaderValuesContainsToken(req.Header.Values("Te"), "trailers")
 	// Stripped before injecting, so a client's Connection header cannot delete the credential.
 	stripHopByHopHeaders(req.Header)
+	if wantsTrailers {
+		req.Header.Set("Te", "trailers")
+	}
 
 	// A service reaches port 443 by default, which everywhere else in the product means TLS, so plain HTTP
 	// here is either a tunnel that declined to handshake or an http:// URL naming 443 — nothing legitimate.
@@ -1006,7 +1112,10 @@ func (ps *proxyServer) forward(req *http.Request, t tunnel) (*http.Response, *re
 				bufferMCPRequest(req, maxMCPInspectBody)
 			}
 		} else if matched.credential.refreshable {
-			bufferRequestBody(req, maxMCPInspectBody)
+			// A gRPC upstream reports a rejected token in a trailer, not as a 401, so there is nothing to replay for.
+			if !streamsGRPCBody(req, t) {
+				bufferRequestBody(req, maxMCPInspectBody)
+			}
 		}
 
 		if matched.hook != nil {
@@ -1105,10 +1214,16 @@ func (ps *proxyServer) forward(req *http.Request, t tunnel) (*http.Response, *re
 // such as *.nip.io lets the client choose the address a name resolves to.
 func (ps *proxyServer) upstreamFor(t tunnel, matched *resolvedService) (http.RoundTripper, error) {
 	if !t.viaSocks5 || ps.socks5AllowPrivate || matched != nil {
+		if t.http2 && ps.http2Transport != nil {
+			return ps.http2Transport, nil
+		}
 		return ps.transport, nil
 	}
 	if ps.guardedTransport == nil {
 		return nil, errPrivateDestination
+	}
+	if t.http2 && ps.guardedHTTP2Transport != nil {
+		return ps.guardedHTTP2Transport, nil
 	}
 	return ps.guardedTransport, nil
 }
@@ -1147,6 +1262,9 @@ type flushingWriter struct {
 	// The last write failure, so a copy error can be told apart from the upstream's own. io.Copy reports
 	// one error for either side.
 	writeErr error
+	// x/net resets an HTTP/2 stream when its write deadline fires, even between writes, so there the deadline
+	// bounds each write and is cleared after it, letting a gRPC stream stay quiet.
+	quietAllowed bool
 }
 
 func (fw *flushingWriter) Write(p []byte) (int, error) {
@@ -1158,6 +1276,9 @@ func (fw *flushingWriter) Write(p []byte) (int, error) {
 	}
 	if flusher, ok := fw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
+	}
+	if fw.quietAllowed && err == nil {
+		_ = fw.rc.SetWriteDeadline(time.Time{})
 	}
 	return n, err
 }

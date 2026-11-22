@@ -610,9 +610,16 @@ func (ps *proxyServer) askHook(req *http.Request, t tunnel, svc *resolvedService
 	if svc.kind != serviceKindMCP && !hook.matches(svc, req, nil) {
 		return nil
 	}
-	prefix, truncated, err := hookBodyPrefix(req, maxHookBodyPrefix)
-	if err != nil {
-		return err
+	// The hook is still asked about a streaming gRPC call, with no body: reading one would wait for the call to end.
+	var prefix []byte
+	truncated := false
+	if streamsGRPCBody(req, t) {
+		truncated = true
+	} else {
+		var err error
+		if prefix, truncated, err = hookBodyPrefix(req, maxHookBodyPrefix); err != nil {
+			return err
+		}
 	}
 	var mcp *hookPayloadMCP
 	var messages []jsonrpcMessage
